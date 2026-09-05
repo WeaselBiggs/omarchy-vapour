@@ -6,6 +6,16 @@ display: it watches the record that `bin/collect` writes to
 `Panel.qml` owns the bar button and the popup; `Main.qml` runs the collector,
 watches the record, and tracks which Steam games currently have a window open.
 
+## Install
+
+```bash
+omarchy plugin add https://github.com/WeaselBiggs/omarchy-steam-playtime.git --enable
+```
+
+Plugins land disabled by default so you can read the code first; `--enable`
+skips that. Needs Steam signed in at least once on the machine (it reads
+`localconfig.vdf`) and `python3`, which Omarchy ships.
+
 ## Panel
 
 - **Hero** — the Steam mark, the total for the week as a pill, and a meta line:
