@@ -107,8 +107,9 @@ Panel {
     else if (steam.weekMode === "monday") parts.push("Since Monday")
     else parts.push("This week")
     parts.push(games.length + (games.length === 1 ? " game" : " games"))
+    // Just the age, no "Updated": with "Steam" up front the line is tight.
     if (root.playing) parts.push("Playing now")
-    else if (steam.updatedAtMs > 0) parts.push("Updated " + steam.formatAgo(steam.updatedAtMs, root.nowMs))
+    else if (steam.updatedAtMs > 0) parts.push(steam.formatAgo(steam.updatedAtMs, root.nowMs))
     return parts.join(" · ")
   }
 
