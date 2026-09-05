@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "id": "dan.steam",
+  "name": "Steam",
+  "version": "0.2.0",
+  "author": "Forsythe McSquiddington",
+  "license": "MIT",
+  "description": "Steam playtime this week, with a Play button and a how-long-to-beat rundown for every game.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Steam",
+    "description": "One bar icon and one panel: hours by day, the games you played this week, a Play button on each, and total time plus estimated length when a row is unfolded.",
+    "category": "Gaming",
+    "aliases": [
+      "steam",
+      "playtime"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 900,
+      "weekMode": "Rolling 7 days",
+      "minMinutes": 5,
+      "showWeekInBar": false,
+      "alwaysShow": false,
+      "lookupNames": true,
+      "hltbEnabled": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 900
+      },
+      {
+        "key": "weekMode",
+        "type": "enum",
+        "label": "Week",
+        "options": [
+          "Rolling 7 days",
+          "Since Monday"
+        ],
+        "defaultValue": "Rolling 7 days",
+        "description": "What \"this week\" means. Either way it is measured from daily snapshots the collector keeps; until seven days exist, Steam's two-week total stands in."
+      },
+      {
+        "key": "minMinutes",
+        "type": "integer",
+        "label": "Hide games under (minutes)",
+        "min": 0,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "showWeekInBar",
+        "type": "boolean",
+        "label": "Show this week's hours next to the bar icon",
+        "defaultValue": false
+      },
+      {
+        "key": "alwaysShow",
+        "type": "boolean",
+        "label": "Keep the icon in the bar with nothing played",
+        "defaultValue": false
+      },
+      {
+        "key": "lookupNames",
+        "type": "boolean",
+        "label": "Look up game names on the Steam store",
+        "defaultValue": true,
+        "description": "Keyless and cached. Off means only installed games get a name."
+      },
+      {
+        "key": "hltbEnabled",
+        "type": "boolean",
+        "label": "Look up game lengths on HowLongToBeat",
+        "defaultValue": true,
+        "description": "Unofficial and cached for a month per game. Off hides the How Long To Beat block unless you keep overrides."
+      }
+    ]
+  }
+}

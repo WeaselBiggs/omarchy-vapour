@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""Collect Steam playtime into one display-ready JSON record.
+
+Steam only keeps two numbers per game in localconfig.vdf: all-time minutes and
+a rolling two-week total. "This week" is derived from daily snapshots of the
+all-time figure that this script keeps under the state directory; until seven
+days of snapshots exist the two-week total stands in and the record says so.
+
+Writes:
+  $XDG_STATE_HOME/omarchy/steam/playtime.json          the record Panel.qml reads
+  $XDG_STATE_HOME/omarchy/steam/snapshots/YYYY-MM-DD.json  {appid: totalMinutes}
+  $XDG_CACHE_HOME/omarchy/steam/apps/<appid>.json       name + header image
+
+HowLongToBeat lengths are read from the cache that bin/hltb maintains (or from
+~/.config/omarchy/steam/hltb-overrides.json, which wins). When any game still
+needs a lookup, bin/hltb is started in the background after the record is
+written; it regenerates the record itself once it has answers.
+
+Usage: collect [--week-mode rolling|monday] [--min-minutes N] [--no-names] [--no-hltb] [--no-hltb-spawn]
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or f"{HOME}/.local/state", "omarchy", "steam")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or f"{HOME}/.cache", "omarchy", "steam")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or f"{HOME}/.config", "omarchy", "steam")
+SNAPSHOT_DIR = os.path.join(STATE_DIR, "snapshots")
+APPS_CACHE_DIR = os.path.join(CACHE_DIR, "apps")
+HLTB_CACHE_DIR = os.path.join(CACHE_DIR, "hltb")
+HLTB_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hltb")
+RECORD_PATH = os.path.join(STATE_DIR, "playtime.json")
+
+SNAPSHOT_KEEP_DAYS = 35
+NAME_RETRY_SECONDS = 24 * 3600
+STORE_API = "https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic"
+
+
+# ------------------------------------------------------------------ vdf
+
+_TOKEN = re.compile(r'"((?:[^"\\]|\\.)*)"|([{}])|(//[^\n]*)|(\S+)')
+
+
+def parse_vdf(text):
+    """Text VDF (KeyValues) to nested dicts. Duplicate keys keep the last value."""
+    root = {}
+    stack = [root]
+    key = None
+    for match in _TOKEN.finditer(text):
+        quoted, brace, comment, bare = match.groups()
+        if comment is not None:
+            continue
+        if brace == "{":
+            child = {}
+            stack[-1][key] = child
+            stack.append(child)
+            key = None
+        elif brace == "}":
+            if len(stack) > 1:
+                stack.pop()
+            key = None
+        else:
+            token = quoted.replace('\\"', '"').replace("\\\\", "\\") if quoted is not None else bare
+            if key is None:
+                key = token
+            else:
+                stack[-1][key] = token
+                key = None
+    return root
+
+
+def walk(node, *path):
+    """Case-insensitive descent; Steam is inconsistent about key casing."""
+    for part in path:
+        if not isinstance(node, dict):
+            return None
+        found = None
+        for k, v in node.items():
+            if k.lower() == part.lower():
+                found = v
+                break
+        if found is None:
+            return None
+        node = found
+    return node
+
+
+# ---------------------------------------------------------------- steam
+
+def steam_root():
+    for candidate in (f"{HOME}/.local/share/Steam", f"{HOME}/.steam/steam", f"{HOME}/.var/app/com.valvesoftware.Steam/.local/share/Steam"):
+        if os.path.isdir(os.path.join(candidate, "userdata")):
+            return candidate
+    return None
+
+
+def most_recent_user(root):
+    """SteamID3 (the userdata folder name) of the most recently signed-in account."""
+    try:
+        with open(os.path.join(root, "config", "loginusers.vdf"), encoding="utf-8", errors="replace") as f:
+            users = walk(parse_vdf(f.read()), "users") or {}
+    except OSError:
+        users = {}
+    chosen = None
+    for steamid64, info in users.items():
+        if isinstance(info, dict) and str(info.get("MostRecent", info.get("mostrecent", "0"))) == "1":
+            chosen = steamid64
+    if chosen is None and users:
+        chosen = next(iter(users))
+    if chosen is not None:
+        return str(int(chosen) - 76561197960265728)
+    dirs = [d for d in os.listdir(os.path.join(root, "userdata")) if d.isdigit() and d != "0"]
+    return dirs[0] if dirs else None
+
+
+def read_playtimes(root, user):
+    path = os.path.join(root, "userdata", user, "config", "localconfig.vdf")
+    with open(path, encoding="utf-8", errors="replace") as f:
+        data = parse_vdf(f.read())
+    apps = walk(data, "UserLocalConfigStore", "Software", "Valve", "Steam", "apps") or {}
+    result = {}
+    for appid, entry in apps.items():
+        if not appid.isdigit() or not isinstance(entry, dict):
+            continue
+        total = walk(entry, "Playtime")
+        if total is None:
+            continue
+        result[appid] = {
+            "total": int(total or 0),
+            "twoWeeks": int(walk(entry, "Playtime2wks") or 0),
+            "lastPlayed": int(walk(entry, "LastPlayed") or 0),
+        }
+    return result
+
+
+def library_manifests(root):
+    """appid -> name for every installed game across all library folders."""
+    folders = [root]
+    try:
+        with open(os.path.join(root, "steamapps", "libraryfolders.vdf"), encoding="utf-8", errors="replace") as f:
+            lib = walk(parse_vdf(f.read()), "libraryfolders") or {}
+        for entry in lib.values():
+            if isinstance(entry, dict) and entry.get("path"):
+                folders.append(entry["path"])
+    except OSError:
+        pass
+    names = {}
+    for folder in dict.fromkeys(folders):
+        steamapps = os.path.join(folder, "steamapps")
+        try:
+            files = os.listdir(steamapps)
+        except OSError:
+            continue
+        for name in files:
+            m = re.match(r"appmanifest_(\d+)\.acf$", name)
+            if not m:
+                continue
+            try:
+                with open(os.path.join(steamapps, name), encoding="utf-8", errors="replace") as f:
+                    state = walk(parse_vdf(f.read()), "AppState") or {}
+                names[m.group(1)] = str(state.get("name") or "")
+            except OSError:
+                continue
+    return names
+
+
+# ------------------------------------------------------------ snapshots
+
+def today():
+    return dt.date.today()
+
+
+def snapshot_path(day):
+    return os.path.join(SNAPSHOT_DIR, f"{day.isoformat()}.json")
+
+
+def load_snapshot(day):
+    try:
+        with open(snapshot_path(day), encoding="utf-8") as f:
+            data = json.load(f)
+        return {k: int(v) for k, v in data.items()} if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def write_json_atomic(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def prune_snapshots(now):
+    try:
+        files = os.listdir(SNAPSHOT_DIR)
+    except OSError:
+        return
+    for name in files:
+        m = re.match(r"(\d{4}-\d{2}-\d{2})\.json$", name)
+        if not m:
+            continue
+        try:
+            day = dt.date.fromisoformat(m.group(1))
+        except ValueError:
+            continue
+        if (now - day).days > SNAPSHOT_KEEP_DAYS:
+            try:
+                os.remove(os.path.join(SNAPSHOT_DIR, name))
+            except OSError:
+                pass
+
+
+def week_baseline(now, mode):
+    """The snapshot that "this week" is measured against, and the date it ideally would be."""
+    if mode == "monday":
+        target = now - dt.timedelta(days=now.weekday() + 1)  # end of last Sunday
+    else:
+        target = now - dt.timedelta(days=7)
+    day = target
+    while day < now:
+        snap = load_snapshot(day)
+        if snap is not None:
+            return day, snap, target
+        day += dt.timedelta(days=1)
+    return None, None, target
+
+
+def day_series(now, current):
+    """Minutes played per calendar day for the last seven days; None where history is missing."""
+    series = []
+    for offset in range(6, -1, -1):
+        day = now - dt.timedelta(days=offset)
+        prev = load_snapshot(day - dt.timedelta(days=1))
+        this = current if offset == 0 else load_snapshot(day)
+        minutes = None
+        if prev is not None and this is not None:
+            minutes = sum(max(0, this.get(a, 0) - prev.get(a, 0)) for a in this)
+        series.append({"date": day.isoformat(), "minutes": minutes})
+    return series
+
+
+# ---------------------------------------------------------------- names
+
+def cached_app(appid):
+    try:
+        with open(os.path.join(APPS_CACHE_DIR, f"{appid}.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def fetch_app(appid):
+    """Keyless store lookup. Failures are cached for a day so a dead entry is not retried every run."""
+    payload = {"name": None, "headerImage": None, "fetchedAt": int(time.time())}
+    try:
+        req = urllib.request.Request(STORE_API.format(appid=appid), headers={"User-Agent": "omarchy-steam-plugin"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            body = json.load(resp)
+        entry = body.get(str(appid)) or {}
+        if entry.get("success") and isinstance(entry.get("data"), dict):
+            payload["name"] = entry["data"].get("name")
+            payload["headerImage"] = entry["data"].get("header_image")
+    except Exception as exc:  # network, JSON, rate limit — all just "no name yet"
+        print(f"collect: store lookup failed for {appid}: {exc}", file=sys.stderr)
+    write_json_atomic(os.path.join(APPS_CACHE_DIR, f"{appid}.json"), payload)
+    return payload
+
+
+def resolve_app(appid, installed_names, allow_network):
+    cached = cached_app(appid)
+    if cached and cached.get("name"):
+        return cached
+    if installed_names.get(appid):
+        return {"name": installed_names[appid], "headerImage": cached.get("headerImage") if cached else None}
+    if not allow_network:
+        return cached or {"name": None, "headerImage": None}
+    if cached and time.time() - int(cached.get("fetchedAt") or 0) < NAME_RETRY_SECONDS:
+        return cached
+    return fetch_app(appid)
+
+
+def hltb_overrides():
+    """Hand-maintained lengths that beat whatever HowLongToBeat says:
+    { "<appid>": { "main": 22.5, "extra": 31, "completionist": 48 } } in hours."""
+    try:
+        with open(os.path.join(CONFIG_DIR, "hltb-overrides.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def hltb_cached(appid):
+    try:
+        with open(os.path.join(HLTB_CACHE_DIR, f"{appid}.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def hltb_for(appid, overrides, enabled):
+    """(hltb block or None, status). Status is one of override, ok, nodata,
+    missing, error, pending, off — the panel words each of them."""
+    override = overrides.get(appid)
+    if isinstance(override, dict):
+        return {**{k: override.get(k) for k in ("main", "extra", "completionist")}, "source": "override"}, "override"
+    if not enabled:
+        return None, "off"
+    cached = hltb_cached(appid)
+    if cached is None:
+        return None, "pending"
+    status = str(cached.get("status") or "error")
+    if status != "ok":
+        return None, status
+    return {
+        "main": cached.get("main"),
+        "extra": cached.get("extra"),
+        "completionist": cached.get("completionist"),
+        "allStyles": cached.get("allStyles"),
+        "name": cached.get("hltbName"),
+        "url": cached.get("url"),
+        "source": "hltb",
+    }, "ok"
+
+
+def spawn_hltb():
+    """Fire the lookups off detached so the record lands now and the lengths
+    arrive when they arrive. hltb exits at once when its cache is fresh."""
+    if not os.access(HLTB_SCRIPT, os.X_OK):
+        return
+    try:
+        subprocess.Popen([HLTB_SCRIPT], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except OSError as exc:
+        print(f"collect: could not start hltb: {exc}", file=sys.stderr)
+
+
+# ----------------------------------------------------------------- main
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--week-mode", choices=["rolling", "monday"], default="rolling")
+    parser.add_argument("--min-minutes", type=int, default=5)
+    parser.add_argument("--no-names", action="store_true", help="skip network lookups for game names")
+    parser.add_argument("--no-hltb", action="store_true", help="do not read or refresh HowLongToBeat lengths")
+    parser.add_argument("--no-hltb-spawn", action="store_true", help="read cached lengths but start no lookup (used by bin/hltb when it regenerates the record)")
+    args = parser.parse_args()
+
+    now = today()
+    record = {
+        "schemaVersion": 1,
+        "updatedAt": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "updatedAtMs": int(time.time() * 1000),
+        "weekMode": args.week_mode,
+        "minMinutes": args.min_minutes,
+        "lookupNames": not args.no_names,
+        "hltbEnabled": not args.no_hltb,
+        "error": "",
+        "games": [],
+        "days": [],
+        "weekMinutes": 0,
+        "weekSource": "none",
+        "baselineDate": "",
+        "historyDays": 0,
+        "fullWeek": False,
+    }
+
+    root = steam_root()
+    user = most_recent_user(root) if root else None
+    if not root or not user:
+        record["error"] = "No Steam installation found"
+        write_json_atomic(RECORD_PATH, record)
+        return 0
+
+    try:
+        playtimes = read_playtimes(root, user)
+    except OSError as exc:
+        record["error"] = f"Could not read Steam playtime: {exc}"
+        write_json_atomic(RECORD_PATH, record)
+        return 0
+
+    current = {appid: p["total"] for appid, p in playtimes.items()}
+    write_json_atomic(snapshot_path(now), current)
+    prune_snapshots(now)
+
+    baseline_day, baseline, target = week_baseline(now, args.week_mode)
+    if baseline is not None:
+        record["weekSource"] = "snapshots"
+        record["baselineDate"] = baseline_day.isoformat()
+        record["historyDays"] = (now - baseline_day).days
+        record["fullWeek"] = baseline_day <= target
+    else:
+        record["weekSource"] = "twoWeeks"
+
+    installed = library_manifests(root)
+    overrides = hltb_overrides()
+    games = []
+    for appid, p in playtimes.items():
+        if baseline is not None:
+            week = max(0, p["total"] - baseline.get(appid, 0))
+            if p["twoWeeks"]:
+                week = min(week, p["twoWeeks"])
+        else:
+            week = p["twoWeeks"]
+        if week < args.min_minutes:
+            continue
+        app = resolve_app(appid, installed, not args.no_names)
+        if not app.get("name"):
+            continue  # non-Steam shortcuts and delisted apps have nothing to show
+        hltb, hltb_status = hltb_for(appid, overrides, not args.no_hltb)
+        games.append({
+            "appId": int(appid),
+            "name": app["name"],
+            "headerImage": app.get("headerImage"),
+            "weekMinutes": week,
+            "twoWeekMinutes": p["twoWeeks"],
+            "totalMinutes": p["total"],
+            "lastPlayed": p["lastPlayed"],
+            "installed": appid in installed,
+            "hltb": hltb,
+            "hltbStatus": hltb_status,
+        })
+
+    games.sort(key=lambda g: (-g["weekMinutes"], -g["lastPlayed"]))
+    record["games"] = games
+    record["weekMinutes"] = sum(g["weekMinutes"] for g in games)
+    record["days"] = day_series(now, current)
+    write_json_atomic(RECORD_PATH, record)
+    if not args.no_hltb and not args.no_hltb_spawn and any(g["hltbStatus"] != "override" for g in games):
+        spawn_hltb()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
