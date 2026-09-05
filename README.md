@@ -1,6 +1,6 @@
-# Steam
+# Vapour
 
-One bar icon and one panel for Steam playtime. The panel is strictly a
+Steam playtime and use, in the Omarchy bar. One bar icon and one panel. The panel is strictly a
 display: it watches the record that `bin/collect` writes to
 `~/.local/state/omarchy/steam/playtime.json` and draws whatever appears there.
 `Panel.qml` owns the bar button and the popup; `Main.qml` runs the collector,
@@ -9,7 +9,7 @@ watches the record, and tracks which Steam games currently have a window open.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/WeaselBiggs/omarchy-steam-playtime.git --enable
+omarchy plugin add https://github.com/WeaselBiggs/omarchy-vapour.git --enable
 ```
 
 Plugins land disabled by default so you can read the code first; `--enable`
@@ -18,8 +18,8 @@ skips that. Needs Steam signed in at least once on the machine (it reads
 
 ## Panel
 
-- **Hero** — the Steam mark, the total for the week as a pill, and a meta line:
-  which window the numbers cover, how many games, and when they were updated
+- **Hero** — the Steam mark, "Vapour", the total for the week as a pill, and a
+  meta line: Steam, which window the numbers cover, how many games, and when they were updated
   (or "Playing now" while a game window is open).
 - **Hours by day** — one row per day for the last week, scaled to the busiest
   day, today bolded at the bottom. Appears once two days of snapshots exist.
@@ -103,14 +103,14 @@ hide the block (overrides still show).
 - Panel: `j`/`k` move, Enter or Space unfold, `l`/`h` unfold/fold, `p` play
   the cursor's game, `r` refresh, Tab moves to the neighboring bar panel, Esc
   closes.
-- IPC: `omarchy-shell dan.steam <open|close|toggle|refresh|play [appid]>`.
+- IPC: `omarchy-shell dan.vapour <open|close|toggle|refresh|play [appid]>`.
   `play` without an app id resumes the top game, which makes a keybinding for
   "resume what I was playing" a one-liner.
 
 ## Settings
 
 Settings live on the widget's entry in `~/.config/omarchy/shell.json` and can
-be set with `omarchy bar set dan.steam <key> <value>` (numbers and booleans
+be set with `omarchy bar set dan.vapour <key> <value>` (numbers and booleans
 need `--json`):
 
 | Key | Default | What it does |

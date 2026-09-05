@@ -5,13 +5,13 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// Steam playtime in the bar: one icon and one panel. Lifted from the layout
+// Vapour: Steam playtime in the bar, one icon and one panel. Lifted from the layout
 // of omarchy.agents — hero, section headers, bars-behind-rows — with the
 // numbers coming from bin/collect via Main.qml instead of usage collectors.
 Panel {
   id: root
-  moduleName: "dan.steam"
-  ipcTarget: "dan.steam"
+  moduleName: "dan.vapour"
+  ipcTarget: "dan.vapour"
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -100,8 +100,9 @@ Panel {
     return steam.weekMinutes > 0 ? steam.formatMinutes(steam.weekMinutes) : ""
   }
 
+  // Leads with "Steam" because the title no longer says it.
   function heroMeta() {
-    var parts = []
+    var parts = ["Steam"]
     if (steam.weekSource === "twoWeeks") parts.push("Last 2 weeks")
     else if (steam.weekMode === "monday") parts.push("Since Monday")
     else parts.push("This week")
@@ -320,7 +321,7 @@ Panel {
           // ---------- Hero: mark · Steam · week total ----------
           PanelHero {
             width: parent.width
-            title: "Steam"
+            title: "Vapour"
             detail: root.heroDetail()
             meta: root.heroMeta()
             foreground: root.foreground

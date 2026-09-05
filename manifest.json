@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "dan.steam",
-  "name": "Steam",
-  "version": "0.2.0",
+  "id": "dan.vapour",
+  "name": "Vapour",
+  "version": "0.3.0",
   "author": "Forsythe McSquiddington",
   "license": "MIT",
-  "description": "Steam playtime this week, with a Play button and a how-long-to-beat rundown for every game.",
+  "description": "Vapour — Steam playtime and use in the Omarchy bar: hours this week, a Play button per game, and HowLongToBeat lengths.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,10 +14,12 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Steam",
-    "description": "One bar icon and one panel: hours by day, the games you played this week, a Play button on each, and total time plus estimated length when a row is unfolded.",
+    "displayName": "Vapour",
+    "description": "Steam playtime tracker. One bar icon and one panel: hours by day, the games you played this week, a Play button on each, and total time plus estimated length when a row is unfolded.",
     "category": "Gaming",
     "aliases": [
+      "vapour",
+      "vapor",
       "steam",
       "playtime"
     ],

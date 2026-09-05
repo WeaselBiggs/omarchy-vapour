@@ -3,7 +3,7 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 
-// The data side of the Steam panel. All extraction lives in bin/collect, which
+// The data side of the Vapour panel. All extraction lives in bin/collect, which
 // writes one JSON record to the state directory; this file only runs it on a
 // timer, watches the record for changes, and keeps an eye on which Steam games
 // currently have a window open.
