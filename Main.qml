@@ -109,8 +109,8 @@ Item {
     var command = [root.collectorPath]
     command.push("--week-mode", String(setting("weekMode", "Rolling 7 days")).toLowerCase().indexOf("monday") >= 0 ? "monday" : "rolling")
     command.push("--min-minutes", String(Math.max(0, numberValue(setting("minMinutes", 5)))))
-    if (setting("lookupNames", true) === false) command.push("--no-names")
-    if (setting("hltbEnabled", true) === false) command.push("--no-hltb")
+    if (!boolSetting("lookupNames", true)) command.push("--no-names")
+    if (!boolSetting("hltbEnabled", true)) command.push("--no-hltb")
     return command
   }
 
@@ -186,6 +186,20 @@ Item {
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
     return value === undefined || value === null ? fallback : value
+  }
+
+  // Booleans may arrive as strings: `omarchy bar set <id> <key> true` without
+  // --json stores "true". Accept the usual spellings either way.
+  function boolSetting(name, fallback) {
+    var value = setting(name, fallback)
+    if (typeof value === "boolean") return value
+    if (typeof value === "number") return value !== 0
+    if (typeof value === "string") {
+      var s = value.trim().toLowerCase()
+      if (s === "true" || s === "1" || s === "yes" || s === "on") return true
+      if (s === "false" || s === "0" || s === "no" || s === "off" || s === "") return false
+    }
+    return fallback
   }
 
   function numberValue(value) {

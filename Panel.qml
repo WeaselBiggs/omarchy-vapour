@@ -213,7 +213,7 @@ Panel {
   }
 
   // Nothing played, nothing in the bar — unless asked to stay.
-  visible: games.length > 0 || steam.setting("alwaysShow", false) === true
+  visible: games.length > 0 || steam.boolSetting("alwaysShow", false)
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -259,7 +259,7 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: steam.setting("showWeekInBar", false) === true && steam.weekMinutes > 0
+    text: steam.boolSetting("showWeekInBar", false) && steam.weekMinutes > 0
       ? root.barGlyph + " " + steam.formatMinutes(steam.weekMinutes)
       : root.barGlyph
     active: root.playing
