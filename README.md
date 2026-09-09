@@ -110,8 +110,14 @@ hide the block (overrides still show).
 ## Settings
 
 Settings live on the widget's entry in `~/.config/omarchy/shell.json` and can
-be set with `omarchy bar set dan.vapour <key> <value>` (numbers and booleans
-need `--json`):
+be set with `omarchy bar set dan.vapour <key> <value>`. Without `--json` the
+value is stored as a string; add `--json` to store a real number or boolean.
+The plugin accepts either form, so both of these keep the icon in the bar:
+
+```bash
+omarchy bar set dan.vapour alwaysShow true          # stores "true"
+omarchy bar set dan.vapour alwaysShow true --json   # stores true
+```
 
 | Key | Default | What it does |
 |---|---|---|
