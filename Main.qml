@@ -4,9 +4,11 @@ import Quickshell.Io
 import Quickshell.Wayland
 
 // The data side of the Vapour panel. All extraction lives in bin/collect, which
-// writes one JSON record to the state directory; this file only runs it on a
-// timer, watches the record for changes, and keeps an eye on which Steam games
-// currently have a window open.
+// writes one JSON record to the state directory; this file runs it on a timer,
+// watches the record for changes, and keeps an eye on which games currently
+// have a window open. For stores that keep no playtime of their own, that
+// watching *is* the playtime: every change is handed to bin/sessions, which
+// keeps the ledger the collector folds in.
 Item {
   id: root
   visible: false
@@ -14,10 +16,12 @@ Item {
   property var settings: ({})
 
   readonly property string home: Quickshell.env("HOME") || ""
-  readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/steam"
+  readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/vapour"
   readonly property string recordPath: stateDir + "/playtime.json"
-  // The collector ships inside the plugin folder so a git checkout is the whole install.
-  readonly property string collectorPath: String(Qt.resolvedUrl("bin/collect")).replace(/^file:\/\//, "")
+  // The scripts ship inside the plugin folder so a git checkout is the whole install.
+  readonly property string binDir: String(Qt.resolvedUrl("bin")).replace(/^file:\/\//, "")
+  readonly property string collectorPath: binDir + "/collect"
+  readonly property string sessionsPath: binDir + "/sessions"
 
   // ---------------------------------------------------------------- record
 
@@ -26,6 +30,9 @@ Item {
 
   readonly property var games: record && Array.isArray(record.games) ? record.games : []
   readonly property var days: record && Array.isArray(record.days) ? record.days : []
+  readonly property var stores: record && Array.isArray(record.stores) ? record.stores : []
+  // Games the collector wants timed: [{ id, classes: ["diablo iv.exe", ...] }].
+  readonly property var watch: record && Array.isArray(record.watch) ? record.watch : []
   readonly property int weekMinutes: record ? numberValue(record.weekMinutes) : 0
   readonly property string weekSource: record ? String(record.weekSource || "none") : "none"
   readonly property string weekMode: record ? String(record.weekMode || "rolling") : "rolling"
@@ -55,10 +62,13 @@ Item {
       var parsed = JSON.parse(String(content || ""))
       root.record = parsed && typeof parsed === "object" ? parsed : null
     } catch (e) {
-      console.warn("steam", "Ignoring bad playtime record", root.recordPath, e)
+      console.warn("vapour", "Ignoring bad playtime record", root.recordPath, e)
       root.record = null
     }
   }
+
+  // A fresh record may carry a new watch table; look again with it.
+  onWatchChanged: rescanRunning()
 
   // --------------------------------------------------------------- refresh
 
@@ -100,7 +110,7 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         var message = text.trim()
-        if (message !== "") console.warn("steam", message)
+        if (message !== "") console.warn("vapour", message)
       }
     }
   }
@@ -128,32 +138,116 @@ Item {
 
   // ----------------------------------------------------------- running games
 
-  // Hyprland already knows when a game is up: Steam titles map to a window
-  // class of steam_app_<appid>, so no Steam API is involved in the "playing"
-  // light. Toplevels are event-driven; the slow timer only catches XWayland
-  // windows whose class arrives after the insert.
-  property var runningAppIds: []
+  // Hyprland already knows when a game is up. Steam titles map to a window
+  // class of steam_app_<appid>; everything else is a Wine window whose class
+  // is the executable's name, matched against the collector's watch table.
+  // Toplevels are event-driven; the slow timer only catches XWayland windows
+  // whose class arrives after the insert.
+  property var runningIds: []
+  // The subset Vapour times itself (everything that is not Steam's).
+  property var runningWatched: []
+  property bool sessionsSynced: false
+
+  function watchedIdFor(windowClass) {
+    var cls = String(windowClass || "").toLowerCase()
+    if (cls === "") return ""
+    for (var i = 0; i < watch.length; i++) {
+      var classes = watch[i] && Array.isArray(watch[i].classes) ? watch[i].classes : []
+      for (var j = 0; j < classes.length; j++)
+        if (String(classes[j]).toLowerCase() === cls) return String(watch[i].id)
+    }
+    return ""
+  }
 
   function rescanRunning() {
     var ids = []
+    var watched = []
     try {
       var values = ToplevelManager.toplevels.values
       for (var i = 0; i < values.length; i++) {
-        var match = String(values[i].appId || "").match(/^steam_app_(\d+)$/)
-        if (match) ids.push(Number(match[1]))
+        var cls = String(values[i].appId || "")
+        var match = cls.match(/^steam_app_(\d+)$/)
+        var id = match ? "steam:" + match[1] : watchedIdFor(cls)
+        if (id === "" || ids.indexOf(id) >= 0) continue
+        ids.push(id)
+        if (!match) watched.push(id)
       }
     } catch (e) {
       ids = []
+      watched = []
     }
     ids.sort()
-    if (JSON.stringify(ids) === JSON.stringify(runningAppIds)) return
-    var stopped = runningAppIds.length > ids.length
-    runningAppIds = ids
-    if (stopped) settleRefresh.restart()
+    watched.sort()
+    var watchedChanged = JSON.stringify(watched) !== JSON.stringify(runningWatched)
+    if (JSON.stringify(ids) !== JSON.stringify(runningIds)) {
+      var steamBefore = runningIds.length - runningWatched.length
+      var steamNow = ids.length - watched.length
+      runningIds = ids
+      runningWatched = watched
+      if (steamNow < steamBefore) settleRefresh.restart()
+    }
+    // The first sync after the record arrives also closes sessions a dead
+    // shell left open; before the record there is no watch table to trust.
+    if (record && (watchedChanged || !sessionsSynced)) syncSessions()
   }
 
-  function isRunning(appId) {
-    return runningAppIds.indexOf(Number(appId)) >= 0
+  function isRunning(id) {
+    return runningIds.indexOf(String(id)) >= 0
+  }
+
+  // ---- the ledger
+
+  property var sessionsQueued: null
+
+  Process {
+    id: sessionSync
+    running: false
+    property bool closedSomething: false
+    onExited: function(exitCode) {
+      if (exitCode !== 0) console.warn("vapour", "sessions sync exited with status " + exitCode)
+      root.sessionsSynced = true
+      if (root.sessionsQueued !== null) {
+        var ids = root.sessionsQueued
+        root.sessionsQueued = null
+        root.runSessionSync(ids)
+      } else if (closedSomething) {
+        closedSomething = false
+        root.refresh()
+      }
+    }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (text.indexOf("closed ") >= 0) sessionSync.closedSomething = true
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var message = text.trim()
+        if (message !== "") console.warn("vapour", message)
+      }
+    }
+  }
+
+  function runSessionSync(ids) {
+    sessionSync.command = [root.sessionsPath, "sync"].concat(ids)
+    sessionSync.running = true
+  }
+
+  function syncSessions() {
+    if (sessionSync.running) {
+      sessionsQueued = runningWatched.slice()
+      return
+    }
+    runSessionSync(runningWatched.slice())
+  }
+
+  // Heartbeat while a watched game is up, so a shell that dies mid-session
+  // still has the time up to the last minute on record.
+  Timer {
+    interval: 60000
+    running: root.runningWatched.length > 0
+    repeat: true
+    onTriggered: root.syncSessions()
   }
 
   Connections {
@@ -173,8 +267,11 @@ Item {
 
   // ---------------------------------------------------------------- actions
 
-  function playCommand(appId) {
-    return "uwsm-app -- steam steam://rungameid/" + Number(appId)
+  // Each game carries its own launch line from the collector: a Steam URI for
+  // Steam, the Battle.net launcher with a product code for Blizzard, whatever
+  // games.json says for the rest.
+  function playCommand(game) {
+    return game && game.play ? String(game.play) : ""
   }
 
   function steamCommand() {

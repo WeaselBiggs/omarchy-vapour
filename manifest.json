@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "dan.vapour",
   "name": "Vapour",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": "Forsythe McSquiddington",
   "license": "MIT",
-  "description": "Vapour — Steam playtime and use in the Omarchy bar: hours this week, a Play button per game, and HowLongToBeat lengths.",
+  "description": "Vapour — playtime in the Omarchy bar for Steam, Battle.net and any other store: hours this week, a Play button per game, and HowLongToBeat lengths.",
   "kinds": [
     "bar-widget"
   ],
@@ -15,12 +15,13 @@
   },
   "barWidget": {
     "displayName": "Vapour",
-    "description": "Steam playtime tracker. One bar icon and one panel: hours by day, the games you played this week, a Play button on each, and total time plus estimated length when a row is unfolded.",
+    "description": "Playtime tracker for Steam, Battle.net and anything else with a window. One bar icon and one panel: hours by day, the games you played this week, a Play button on each, and total time plus estimated length when a row is unfolded.",
     "category": "Gaming",
     "aliases": [
       "vapour",
       "vapor",
       "steam",
+      "battlenet",
       "playtime"
     ],
     "allowMultiple": false,

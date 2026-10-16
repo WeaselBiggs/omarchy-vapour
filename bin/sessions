@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""The sessions ledger: playtime Vapour measures itself.
+
+Stores other than Steam keep no playtime on disk, so Main.qml watches for the
+game's window and tells this script which watched games are up right now.
+Each call reconciles the ledger with that list: games that just appeared get
+an open session, games still up get their heartbeat refreshed, games that are
+gone get their session closed. A session that was open when the shell died is
+closed at its last heartbeat, not at the moment someone noticed, so a crash
+never inflates the figures.
+
+  $XDG_STATE_HOME/omarchy/vapour/sessions.json
+    { "open":     { "<id>": { "start": <unix s>, "seen": <unix s> } },
+      "sessions": [ { "id": "<id>", "start": <unix s>, "end": <unix s> }, ... ] }
+
+Usage:
+  sessions sync [ID ...]            reconcile with the games up right now
+  sessions add ID START MINUTES     backfill a session; START is ISO 8601 local time
+  sessions list [ID]                print the ledger, newest first
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import sys
+import tempfile
+import time
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or f"{HOME}/.local/state", "omarchy", "vapour")
+LEDGER_PATH = os.path.join(STATE_DIR, "sessions.json")
+
+# A heartbeat older than this means the watcher was not running; the session
+# ends at the heartbeat rather than now.
+STALE_SECONDS = 120
+# Flickers shorter than this (a crash on launch, a mis-matched window) are dropped.
+MIN_SESSION_SECONDS = 30
+
+
+def load():
+    try:
+        with open(LEDGER_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("open", {})
+    data.setdefault("sessions", [])
+    if not isinstance(data["open"], dict):
+        data["open"] = {}
+    if not isinstance(data["sessions"], list):
+        data["sessions"] = []
+    return data
+
+
+def save(data):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=STATE_DIR, prefix=".tmp-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, LEDGER_PATH)
+
+
+def close(data, game_id, entry, now):
+    start = float(entry.get("start") or now)
+    seen = float(entry.get("seen") or start)
+    end = seen if now - seen > STALE_SECONDS else now
+    if end - start >= MIN_SESSION_SECONDS:
+        data["sessions"].append({"id": game_id, "start": int(start), "end": int(end)})
+
+
+def sync(ids):
+    data = load()
+    now = time.time()
+    up = set(ids)
+    closed = []
+    for game_id, entry in list(data["open"].items()):
+        if game_id in up:
+            if now - float(entry.get("seen") or 0) > STALE_SECONDS and float(entry.get("seen") or 0) > 0:
+                # The watcher was away long enough that this is a new sitting.
+                close(data, game_id, entry, now)
+                data["open"][game_id] = {"start": int(now), "seen": int(now)}
+            else:
+                entry["seen"] = int(now)
+        else:
+            close(data, game_id, entry, now)
+            del data["open"][game_id]
+            closed.append(game_id)
+    for game_id in up:
+        if game_id not in data["open"]:
+            data["open"][game_id] = {"start": int(now), "seen": int(now)}
+    save(data)
+    for game_id in closed:
+        print(f"closed {game_id}")
+    return 0
+
+
+def add(game_id, start_text, minutes):
+    start = dt.datetime.fromisoformat(start_text)
+    if start.tzinfo is None:
+        start = start.astimezone()
+    data = load()
+    data["sessions"].append({"id": game_id, "start": int(start.timestamp()), "end": int(start.timestamp() + minutes * 60)})
+    data["sessions"].sort(key=lambda s: s["start"])
+    save(data)
+    return 0
+
+
+def list_sessions(game_id):
+    data = load()
+    rows = [s for s in data["sessions"] if not game_id or s.get("id") == game_id]
+    for s in sorted(rows, key=lambda s: -float(s.get("start") or 0)):
+        start = dt.datetime.fromtimestamp(float(s["start"])).strftime("%Y-%m-%d %H:%M")
+        print(f"{s['id']:<24} {start}  {int((float(s['end']) - float(s['start'])) / 60):>5} min")
+    for gid, entry in data["open"].items():
+        if game_id and gid != game_id:
+            continue
+        start = dt.datetime.fromtimestamp(float(entry["start"])).strftime("%Y-%m-%d %H:%M")
+        print(f"{gid:<24} {start}  {int((float(entry['seen']) - float(entry['start'])) / 60):>5} min  (open)")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("sync", help="reconcile the ledger with the games up right now")
+    p.add_argument("ids", nargs="*")
+    p = sub.add_parser("add", help="backfill a session")
+    p.add_argument("id")
+    p.add_argument("start", help="ISO 8601, e.g. 2026-10-15T20:30")
+    p.add_argument("minutes", type=float)
+    p = sub.add_parser("list", help="print the ledger")
+    p.add_argument("id", nargs="?")
+    args = parser.parse_args()
+    if args.command == "sync":
+        return sync(args.ids)
+    if args.command == "add":
+        return add(args.id, args.start, args.minutes)
+    return list_sessions(args.id)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

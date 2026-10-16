@@ -5,9 +5,11 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// Vapour: Steam playtime in the bar, one icon and one panel. Lifted from the layout
+// Vapour: playtime in the bar, one icon and one panel. Lifted from the layout
 // of omarchy.agents — hero, section headers, bars-behind-rows — with the
 // numbers coming from bin/collect via Main.qml instead of usage collectors.
+// Games are keyed by the record's string id ("steam:1551980", "bnet:fenris"),
+// never by slot, so a refresh that reorders the list cannot swap rows.
 Panel {
   id: root
   moduleName: "dan.vapour"
@@ -26,16 +28,16 @@ Panel {
   readonly property string glyph: "󰓓"
   readonly property string barGlyph: "\uef59"  // fa-mug_hot: a filled mug that is visibly steaming
 
-  readonly property var games: steam.games
-  readonly property bool playing: steam.runningAppIds.length > 0
+  readonly property var games: vapour.games
+  readonly property bool playing: vapour.runningIds.length > 0
 
   // The cursor and the unfolded row follow the game, not its slot: a refresh
   // that reorders the list under an open panel must not swap what you're reading.
-  property int cursorAppId: 0
-  property int expandedAppId: 0
+  property string cursorId: ""
+  property string expandedId: ""
   property bool cursorActive: false
 
-  readonly property int cursorIndex: indexOfApp(cursorAppId)
+  readonly property int cursorIndex: indexOfGame(cursorId)
   readonly property var cursorGame: cursorIndex >= 0 ? games[cursorIndex] : null
 
   // "Updated 6m ago" and "last played today" read this instead of Date.now()
@@ -45,10 +47,18 @@ Panel {
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
   function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
 
-  function indexOfApp(appId) {
+  function indexOfGame(id) {
+    var wanted = String(id || "")
+    if (wanted === "") return -1
     for (var i = 0; i < games.length; i++)
-      if (Number(games[i].appId) === Number(appId)) return i
+      if (String(games[i].id || "") === wanted) return i
     return -1
+  }
+
+  // IPC callers may still pass a bare Steam app id.
+  function normalizeId(id) {
+    var text = String(id || "").trim()
+    return /^\d+$/.test(text) ? "steam:" + text : text
   }
 
   function moveCursor(delta) {
@@ -56,30 +66,32 @@ Panel {
     var index = cursorIndex < 0 ? (delta > 0 ? -1 : 0) : cursorIndex
     index = clamp(index + delta, 0, games.length - 1)
     cursorActive = true
-    cursorAppId = Number(games[index].appId)
+    cursorId = String(games[index].id || "")
     Qt.callLater(ensureCursorVisible)
   }
 
-  function toggleExpanded(appId) {
-    var id = Number(appId)
-    expandedAppId = expandedAppId === id ? 0 : id
+  function toggleExpanded(id) {
+    var wanted = String(id || "")
+    expandedId = expandedId === wanted ? "" : wanted
   }
 
-  function play(appId) {
-    var id = Number(appId)
-    if (!(id > 0)) return
-    if (root.bar) root.bar.run(steam.playCommand(id))
+  function play(id) {
+    var index = indexOfGame(id)
+    if (index < 0) return
+    var command = vapour.playCommand(games[index])
+    if (command === "") return
+    if (root.bar) root.bar.run(command)
     root.close()
   }
 
   function launchSteam() {
-    if (root.bar) root.bar.run(steam.steamCommand())
+    if (root.bar) root.bar.run(vapour.steamCommand())
     root.close()
   }
 
   function refreshNow() {
-    steam.refresh()
-    steam.rescanRunning()
+    vapour.refresh()
+    vapour.rescanRunning()
   }
 
   // Keep the keyboard cursor's row inside the scrolled viewport.
@@ -97,29 +109,29 @@ Panel {
   // ---------------------------------------------------------------- content
 
   function heroDetail() {
-    return steam.weekMinutes > 0 ? steam.formatMinutes(steam.weekMinutes) : ""
+    return vapour.weekMinutes > 0 ? vapour.formatMinutes(vapour.weekMinutes) : ""
   }
 
-  // Leads with "Steam" because the title no longer says it.
+  // Leads with the stores because the title no longer says any of them.
   function heroMeta() {
-    var parts = ["Steam"]
-    if (steam.weekSource === "twoWeeks") parts.push("Last 2 weeks")
-    else if (steam.weekMode === "monday") parts.push("Since Monday")
+    var parts = [vapour.stores.length > 0 ? vapour.stores.join(" + ") : "Steam"]
+    if (vapour.weekSource === "twoWeeks") parts.push("Last 2 weeks")
+    else if (vapour.weekMode === "monday") parts.push("Since Monday")
     else parts.push("This week")
     parts.push(games.length + (games.length === 1 ? " game" : " games"))
-    // Just the age, no "Updated": with "Steam" up front the line is tight.
+    // Just the age, no "Updated": with the stores up front the line is tight.
     if (root.playing) parts.push("Playing now")
-    else if (steam.updatedAtMs > 0) parts.push(steam.formatAgo(steam.updatedAtMs, root.nowMs))
+    else if (vapour.updatedAtMs > 0) parts.push(vapour.formatAgo(vapour.updatedAtMs, root.nowMs))
     return parts.join(" · ")
   }
 
   // Only speaks up while the week is still being assembled from snapshots.
   function footerText() {
-    if (steam.weekSource === "twoWeeks")
+    if (vapour.weekSource === "twoWeeks")
       return "Showing Steam's two-week totals — daily history starts today"
-    if (steam.weekSource === "snapshots" && !steam.fullWeek) {
-      var remaining = Math.max(1, 7 - steam.historyDays)
-      return "History since " + steam.baselineDate + " · full week in " + remaining + (remaining === 1 ? " day" : " days")
+    if (vapour.weekSource === "snapshots" && !vapour.fullWeek) {
+      var remaining = Math.max(1, 7 - vapour.historyDays)
+      return "History since " + vapour.baselineDate + " · full week in " + remaining + (remaining === 1 ? " day" : " days")
     }
     return ""
   }
@@ -139,7 +151,7 @@ Panel {
 
   function dayPeak() {
     var peak = 0
-    for (var i = 0; i < steam.days.length; i++) peak = Math.max(peak, Number(steam.days[i].minutes || 0))
+    for (var i = 0; i < vapour.days.length; i++) peak = Math.max(peak, Number(vapour.days[i].minutes || 0))
     return Math.max(1, peak)
   }
 
@@ -149,8 +161,8 @@ Panel {
 
   function gameTooltip(game) {
     if (!game) return ""
-    var text = steam.formatMinutes(game.weekMinutes) + " this week · " + steam.formatMinutes(game.totalMinutes) + " total"
-    if (steam.isRunning(game.appId)) text += " · playing now"
+    var text = vapour.formatMinutes(game.weekMinutes) + " this week · " + vapour.formatMinutes(game.totalMinutes) + " total"
+    if (vapour.isRunning(game.id)) text += " · playing now"
     return text
   }
 
@@ -163,7 +175,7 @@ Panel {
     var main = Number(hltb.main || 0)
     var completionist = Number(hltb.completionist || 0)
     if (main > 0 && played < main)
-      return { ratio: played / main, text: "~" + steam.formatHours(main - played) + " left in the main story" }
+      return { ratio: played / main, text: "~" + vapour.formatHours(main - played) + " left in the main story" }
     if (completionist > 0 && played < completionist) {
       var percent = Math.round(played / completionist * 100) + "% of the way to completionist"
       // Some games only ever get a completionist figure; there is no main
@@ -178,10 +190,10 @@ Panel {
   function hltbLine(hltb) {
     if (!hltb) return ""
     var parts = []
-    if (Number(hltb.main) > 0) parts.push("Main " + steam.formatHours(hltb.main))
-    if (Number(hltb.extra) > 0) parts.push("Main + Extra " + steam.formatHours(hltb.extra))
-    if (Number(hltb.completionist) > 0) parts.push("100% " + steam.formatHours(hltb.completionist))
-    if (parts.length === 0 && Number(hltb.allStyles) > 0) parts.push("All styles " + steam.formatHours(hltb.allStyles))
+    if (Number(hltb.main) > 0) parts.push("Main " + vapour.formatHours(hltb.main))
+    if (Number(hltb.extra) > 0) parts.push("Main + Extra " + vapour.formatHours(hltb.extra))
+    if (Number(hltb.completionist) > 0) parts.push("100% " + vapour.formatHours(hltb.completionist))
+    if (parts.length === 0 && Number(hltb.allStyles) > 0) parts.push("All styles " + vapour.formatHours(hltb.allStyles))
     return parts.join(" · ")
   }
 
@@ -213,7 +225,7 @@ Panel {
   }
 
   // Nothing played, nothing in the bar — unless asked to stay.
-  visible: games.length > 0 || steam.boolSetting("alwaysShow", false)
+  visible: games.length > 0 || vapour.boolSetting("alwaysShow", false)
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -221,12 +233,12 @@ Panel {
     cursorActive = false
     nowMs = Date.now()
     if (panelFlick) panelFlick.contentY = 0
-    steam.rescanRunning()
+    vapour.rescanRunning()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
   Main {
-    id: steam
+    id: vapour
     settings: root.settings
   }
 
@@ -246,11 +258,11 @@ Panel {
     function toggle(): void { root.toggle() }
     function refresh(): string { root.refreshNow(); return "ok" }
     // `play` alone resumes the game you spent the most time on this week.
-    function play(appId: string): string {
-      var id = Number(appId)
-      if (!(id > 0) && root.games.length > 0) id = Number(root.games[0].appId)
-      if (!(id > 0)) return "no game"
-      root.play(id)
+    function play(id: string): string {
+      var wanted = root.normalizeId(id)
+      if (wanted === "" && root.games.length > 0) wanted = String(root.games[0].id || "")
+      if (root.indexOfGame(wanted) < 0) return "no game"
+      root.play(wanted)
       return "ok"
     }
   }
@@ -259,14 +271,14 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: steam.boolSetting("showWeekInBar", false) && steam.weekMinutes > 0
-      ? root.barGlyph + " " + steam.formatMinutes(steam.weekMinutes)
+    text: vapour.boolSetting("showWeekInBar", false) && vapour.weekMinutes > 0
+      ? root.barGlyph + " " + vapour.formatMinutes(vapour.weekMinutes)
       : root.barGlyph
     active: root.playing
     tooltipText: ""
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) root.launchSteam()
-      else if (buttonCode === Qt.MiddleButton && root.games.length > 0) root.play(root.games[0].appId)
+      else if (buttonCode === Qt.MiddleButton && root.games.length > 0) root.play(root.games[0].id)
       else root.toggle()
     }
   }
@@ -290,17 +302,17 @@ Panel {
         // Left folds the cursor's row, right unfolds it — the row is the
         // horizontal axis here, there is nothing else to switch between.
         if (dx !== 0 && root.cursorGame) {
-          if (dx > 0) root.expandedAppId = Number(root.cursorGame.appId)
-          else if (root.expandedAppId === Number(root.cursorGame.appId)) root.expandedAppId = 0
+          if (dx > 0) root.expandedId = String(root.cursorGame.id || "")
+          else if (root.expandedId === String(root.cursorGame.id || "")) root.expandedId = ""
         }
       }
-      onActivateRequested: if (root.cursorGame) root.toggleExpanded(root.cursorGame.appId)
+      onActivateRequested: if (root.cursorGame) root.toggleExpanded(root.cursorGame.id)
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refreshNow()
-        else if ((t === "p" || t === "P") && root.cursorGame) root.play(root.cursorGame.appId)
-        else if (t === " " && root.cursorGame) root.toggleExpanded(root.cursorGame.appId)
+        else if ((t === "p" || t === "P") && root.cursorGame) root.play(root.cursorGame.id)
+        else if (t === " " && root.cursorGame) root.toggleExpanded(root.cursorGame.id)
       }
 
       Flickable {
@@ -341,7 +353,7 @@ Panel {
 
           // ---------- Status ----------
           BorderSurface {
-            visible: steam.errorText !== ""
+            visible: vapour.errorText !== ""
             width: parent.width
             implicitHeight: statusText.implicitHeight + Style.spacing.xl * 2
             color: root.alpha(root.urgent, 0.10)
@@ -356,7 +368,7 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
               anchors.leftMargin: Style.space(12)
               anchors.rightMargin: Style.space(12)
-              text: steam.errorText
+              text: vapour.errorText
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -365,12 +377,12 @@ Panel {
           }
 
           Text {
-            visible: root.games.length === 0 && steam.errorText === ""
+            visible: root.games.length === 0 && vapour.errorText === ""
             width: parent.width
             topPadding: Style.space(24)
-            text: steam.record
+            text: vapour.record
               ? "Nothing played this week.\nGames show up here once you've launched them."
-              : "Reading Steam playtime…"
+              : "Reading playtime…"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -386,7 +398,7 @@ Panel {
 
           Column {
             id: daysSection
-            visible: steam.hasDayHistory
+            visible: vapour.hasDayHistory
             width: parent.width
             spacing: Style.spacing.md
 
@@ -400,7 +412,7 @@ Panel {
             }
 
             Repeater {
-              model: steam.days
+              model: vapour.days
 
               DayRow {
                 required property var modelData
@@ -553,7 +565,7 @@ Panel {
     Text {
       id: dayValue
       textFormat: Text.PlainText
-      text: dayRow.known ? steam.formatMinutes(dayRow.day.minutes) : "—"
+      text: dayRow.known ? vapour.formatMinutes(dayRow.day.minutes) : "—"
       color: dayRow.today ? root.foreground : root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
@@ -572,10 +584,11 @@ Panel {
     property var game: null
     property real share: 0
 
-    readonly property int appId: game ? Number(game.appId) : 0
-    readonly property bool expanded: appId !== 0 && root.expandedAppId === appId
-    readonly property bool hasCursor: root.cursorActive && root.cursorAppId === appId
-    readonly property bool running: steam.isRunning(appId)
+    readonly property string gameId: game ? String(game.id || "") : ""
+    readonly property bool expanded: gameId !== "" && root.expandedId === gameId
+    readonly property bool hasCursor: root.cursorActive && root.cursorId === gameId
+    readonly property bool running: vapour.isRunning(gameId)
+    readonly property bool launchable: !!game && String(game.play || "") !== ""
     readonly property var progressInfo: root.progress(game)
     readonly property bool hltbVisible: !!game && (String(game.hltbStatus || "") !== "off" || !!game.hltb)
 
@@ -620,12 +633,12 @@ Panel {
         cursorShape: Qt.PointingHandCursor
         onContainsMouseChanged: if (containsMouse) {
           root.cursorActive = true
-          root.cursorAppId = gameRow.appId
+          root.cursorId = gameRow.gameId
         }
         onClicked: {
           root.cursorActive = true
-          root.cursorAppId = gameRow.appId
-          root.toggleExpanded(gameRow.appId)
+          root.cursorId = gameRow.gameId
+          root.toggleExpanded(gameRow.gameId)
         }
       }
 
@@ -661,7 +674,7 @@ Panel {
       Text {
         id: gameMinutes
         textFormat: Text.PlainText
-        text: gameRow.game ? steam.formatMinutes(gameRow.game.weekMinutes) : ""
+        text: gameRow.game ? vapour.formatMinutes(gameRow.game.weekMinutes) : ""
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -677,11 +690,12 @@ Panel {
         anchors.rightMargin: Style.space(4)
         anchors.verticalCenter: parent.verticalCenter
         iconText: "󰐊"
+        visible: gameRow.launchable
         tooltipText: gameRow.running ? "Already running" : (gameRow.game && gameRow.game.installed === false ? "Play (installs first)" : "Play")
         foreground: root.foreground
         fontFamily: root.fontFamily
         enabled: !gameRow.running
-        onClicked: root.play(gameRow.appId)
+        onClicked: root.play(gameRow.gameId)
       }
 
       PanelToolTip {
@@ -713,9 +727,14 @@ Panel {
         anchors.rightMargin: Style.space(10)
         spacing: Style.space(6)
 
-        StatLine { label: "Total"; value: gameRow.game ? steam.formatMinutes(gameRow.game.totalMinutes) : "" }
-        StatLine { label: "Last 2 weeks"; value: gameRow.game ? steam.formatMinutes(gameRow.game.twoWeekMinutes) : "" }
-        StatLine { label: "Last played"; value: gameRow.game ? steam.formatLastPlayed(gameRow.game.lastPlayed, root.nowMs) : "" }
+        StatLine {
+          visible: vapour.stores.length > 1
+          label: "Store"
+          value: gameRow.game ? String(gameRow.game.store || "") : ""
+        }
+        StatLine { label: "Total"; value: gameRow.game ? vapour.formatMinutes(gameRow.game.totalMinutes) : "" }
+        StatLine { label: "Last 2 weeks"; value: gameRow.game ? vapour.formatMinutes(gameRow.game.twoWeekMinutes) : "" }
+        StatLine { label: "Last played"; value: gameRow.game ? vapour.formatLastPlayed(gameRow.game.lastPlayed, root.nowMs) : "" }
         StatLine {
           visible: gameRow.game && gameRow.game.installed === false
           label: "Installed"

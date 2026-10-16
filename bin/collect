@@ -1,29 +1,42 @@
 #!/usr/bin/env python3
-"""Collect Steam playtime into one display-ready JSON record.
+"""Collect playtime from every store into one display-ready JSON record.
 
-Steam only keeps two numbers per game in localconfig.vdf: all-time minutes and
-a rolling two-week total. "This week" is derived from daily snapshots of the
+Steam keeps its own figures: all-time minutes and a rolling two-week total per
+game in localconfig.vdf. "This week" is derived from daily snapshots of the
 all-time figure that this script keeps under the state directory; until seven
 days of snapshots exist the two-week total stands in and the record says so.
 
+Every other store (Battle.net first, anything else through games.json) keeps
+no playtime on disk, so Vapour is the stopwatch: Main.qml times the game's
+window and bin/sessions writes the sessions ledger. Those games get their week,
+day, two-week and total figures straight from the ledger.
+
 Writes:
-  $XDG_STATE_HOME/omarchy/steam/playtime.json          the record Panel.qml reads
-  $XDG_STATE_HOME/omarchy/steam/snapshots/YYYY-MM-DD.json  {appid: totalMinutes}
-  $XDG_CACHE_HOME/omarchy/steam/apps/<appid>.json       name + header image
+  $XDG_STATE_HOME/omarchy/vapour/playtime.json            the record Panel.qml reads
+  $XDG_STATE_HOME/omarchy/vapour/snapshots/YYYY-MM-DD.json  {appid: totalMinutes}
+  $XDG_CACHE_HOME/omarchy/vapour/apps/<appid>.json          Steam name + header image
+
+Reads:
+  $XDG_STATE_HOME/omarchy/vapour/sessions.json            the ledger bin/sessions keeps
+  $XDG_CONFIG_HOME/omarchy/vapour/games.json              watched games and store settings
+  $XDG_CONFIG_HOME/omarchy/vapour/hltb-overrides.json     hand-maintained lengths
 
 HowLongToBeat lengths are read from the cache that bin/hltb maintains (or from
-~/.config/omarchy/steam/hltb-overrides.json, which wins). When any game still
-needs a lookup, bin/hltb is started in the background after the record is
-written; it regenerates the record itself once it has answers.
+the overrides file, which wins). When any game still needs a lookup, bin/hltb
+is started in the background after the record is written; it regenerates the
+record itself once it has answers.
 
 Usage: collect [--week-mode rolling|monday] [--min-minutes N] [--no-names] [--no-hltb] [--no-hltb-spawn]
 """
 
 import argparse
 import datetime as dt
+import glob
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,18 +44,57 @@ import time
 import urllib.request
 
 HOME = os.path.expanduser("~")
-STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or f"{HOME}/.local/state", "omarchy", "steam")
-CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or f"{HOME}/.cache", "omarchy", "steam")
-CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or f"{HOME}/.config", "omarchy", "steam")
+XDG_STATE = os.environ.get("XDG_STATE_HOME") or f"{HOME}/.local/state"
+XDG_CACHE = os.environ.get("XDG_CACHE_HOME") or f"{HOME}/.cache"
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or f"{HOME}/.config"
+STATE_DIR = os.path.join(XDG_STATE, "omarchy", "vapour")
+CACHE_DIR = os.path.join(XDG_CACHE, "omarchy", "vapour")
+CONFIG_DIR = os.path.join(XDG_CONFIG, "omarchy", "vapour")
 SNAPSHOT_DIR = os.path.join(STATE_DIR, "snapshots")
 APPS_CACHE_DIR = os.path.join(CACHE_DIR, "apps")
 HLTB_CACHE_DIR = os.path.join(CACHE_DIR, "hltb")
-HLTB_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hltb")
+BIN_DIR = os.path.dirname(os.path.abspath(__file__))
+HLTB_SCRIPT = os.path.join(BIN_DIR, "hltb")
 RECORD_PATH = os.path.join(STATE_DIR, "playtime.json")
+SESSIONS_PATH = os.path.join(STATE_DIR, "sessions.json")
+GAMES_CONFIG_PATH = os.path.join(CONFIG_DIR, "games.json")
 
 SNAPSHOT_KEEP_DAYS = 35
 NAME_RETRY_SECONDS = 24 * 3600
 STORE_API = "https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic"
+
+# Where `omarchy-install-gaming-battlenet` puts the client.
+BNET_DEFAULT_PREFIX = os.path.join(HOME, "Games", "battlenet")
+BNET_LAUNCHER = "drive_c/Program Files (x86)/Battle.net/Battle.net Launcher.exe"
+
+# Battle.net product code (as it appears in Battle.net.config) -> display name,
+# install folder under Program Files (x86), the executables whose window means
+# the game is up, and the code `Battle.net Launcher.exe --exec="launch X"` takes.
+BNET_PRODUCTS = {
+    "fenris": ("Diablo IV", "Diablo IV", ["Diablo IV.exe"], "Fen"),
+    "osi": ("Diablo II: Resurrected", "Diablo II Resurrected", ["D2R.exe"], "OSI"),
+    "d3": ("Diablo III", "Diablo III", ["Diablo III64.exe", "Diablo III.exe"], "D3"),
+    "anbs": ("Diablo Immortal", "Diablo Immortal", ["DiabloImmortal.exe"], "ANBS"),
+    "pro": ("Overwatch 2", "Overwatch", ["Overwatch.exe"], "Pro"),
+    "wow": ("World of Warcraft", "World of Warcraft", ["Wow.exe", "WowT.exe"], "WoW"),
+    "wow_classic": ("World of Warcraft Classic", "World of Warcraft", ["WowClassic.exe", "WowClassicT.exe"], "WoWC"),
+    "wow_classic_era": ("World of Warcraft Classic Era", "World of Warcraft", ["WowClassic.exe"], "WoWClassicEra"),
+    "s2": ("StarCraft II", "StarCraft II", ["SC2_x64.exe", "SC2.exe"], "S2"),
+    "s1": ("StarCraft", "StarCraft", ["StarCraft.exe"], "S1"),
+    "w3": ("Warcraft III", "Warcraft III", ["Warcraft III.exe"], "W3"),
+    "hero": ("Heroes of the Storm", "Heroes of the Storm", ["HeroesOfTheStorm_x64.exe", "HeroesOfTheStorm.exe"], "Hero"),
+    "hsb": ("Hearthstone", "Hearthstone", ["Hearthstone.exe"], "WTCG"),
+    "gryphon": ("Warcraft Rumble", "Warcraft Rumble", ["WarcraftRumble.exe"], "GRY"),
+    "viper": ("Call of Duty: Black Ops 4", "Call of Duty Black Ops 4", ["BlackOps4.exe"], "VIPR"),
+    "odin": ("Call of Duty: Modern Warfare", "Call of Duty Modern Warfare", ["ModernWarfare.exe"], "ODIN"),
+    "zeus": ("Call of Duty: Black Ops Cold War", "Call of Duty Black Ops Cold War", ["BlackOpsColdWar.exe"], "ZEUS"),
+    "fore": ("Call of Duty: Vanguard", "Call of Duty Vanguard", ["Vanguard.exe"], "FORE"),
+    "auks": ("Call of Duty", "Call of Duty", ["cod.exe"], "AUKS"),
+    "lazr": ("Call of Duty: Modern Warfare II", "Call of Duty", ["cod.exe"], "LAZR"),
+    "wlby": ("Crash Bandicoot 4", "Crash Bandicoot 4", ["CrashBandicoot4.exe"], "WLBY"),
+    "rtro": ("Blizzard Arcade Collection", "Blizzard Arcade Collection", ["Blizzard Arcade Collection.exe"], "RTRO"),
+}
+BNET_NOT_GAMES = {"battle_net", "agent", "bna", "bts", "catalogs", "clnt"}
 
 
 # ------------------------------------------------------------------ vdf
@@ -236,8 +288,8 @@ def week_baseline(now, mode):
     return None, None, target
 
 
-def day_series(now, current):
-    """Minutes played per calendar day for the last seven days; None where history is missing."""
+def steam_day_series(now, current):
+    """Steam minutes per calendar day for the last seven days; None where history is missing."""
     series = []
     for offset in range(6, -1, -1):
         day = now - dt.timedelta(days=offset)
@@ -248,6 +300,160 @@ def day_series(now, current):
             minutes = sum(max(0, this.get(a, 0) - prev.get(a, 0)) for a in this)
         series.append({"date": day.isoformat(), "minutes": minutes})
     return series
+
+
+# -------------------------------------------------------------- sessions
+
+def load_sessions():
+    """The ledger bin/sessions keeps: closed sessions plus the ones open now."""
+    try:
+        with open(SESSIONS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    spans = {}
+    for entry in data.get("sessions") or []:
+        try:
+            start, end = float(entry["start"]), float(entry["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end > start:
+            spans.setdefault(str(entry.get("id")), []).append((start, end))
+    for game_id, entry in (data.get("open") or {}).items():
+        try:
+            start, seen = float(entry["start"]), float(entry["seen"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if seen > start:
+            spans.setdefault(str(game_id), []).append((start, seen))
+    return spans
+
+
+def overlap_minutes(spans, lo, hi):
+    seconds = 0.0
+    for start, end in spans:
+        seconds += max(0.0, min(end, hi) - max(start, lo))
+    return int(round(seconds / 60))
+
+
+def sessions_day_series(now, spans_by_id):
+    all_spans = [span for spans in spans_by_id.values() for span in spans]
+    series = []
+    for offset in range(6, -1, -1):
+        day = now - dt.timedelta(days=offset)
+        lo = dt.datetime.combine(day, dt.time.min).astimezone().timestamp()
+        hi = lo + 86400
+        minutes = overlap_minutes(all_spans, lo, hi)
+        series.append({"date": day.isoformat(), "minutes": minutes if minutes > 0 else None})
+    return series
+
+
+def merge_day_series(steam_days, session_days):
+    merged = []
+    for s, o in zip(steam_days, session_days):
+        if s["minutes"] is None and o["minutes"] is None:
+            minutes = None
+        else:
+            minutes = int(s["minutes"] or 0) + int(o["minutes"] or 0)
+        merged.append({"date": s["date"], "minutes": minutes})
+    return merged
+
+
+def week_window(now_dt, mode):
+    """(start, end) timestamps for "this week" as the sessions ledger sees it."""
+    if mode == "monday":
+        monday = (now_dt - dt.timedelta(days=now_dt.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        return monday.timestamp(), now_dt.timestamp()
+    return now_dt.timestamp() - 7 * 86400, now_dt.timestamp()
+
+
+# --------------------------------------------------------- watched games
+
+def load_games_config():
+    try:
+        with open(GAMES_CONFIG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def uwsm(argv):
+    return "uwsm-app -- " + " ".join(shlex.quote(a) for a in argv)
+
+
+def bnet_play_command(prefix, launch_code, template):
+    launcher = os.path.join(prefix, BNET_LAUNCHER)
+    if template:
+        return str(template).replace("{code}", launch_code).replace("{prefix}", shlex.quote(prefix)).replace("{launcher}", shlex.quote(launcher))
+    return uwsm(["env", f"WINEPREFIX={prefix}", "PROTONPATH=GE-Proton", "GAMEID=umu-battlenet", "PROTON_VERB=run",
+                 "umu-run", launcher, f'--exec=launch {launch_code}'])
+
+
+def discover_battlenet(config):
+    """Installed Blizzard products, from the client's own config in the prefix."""
+    settings = config.get("battlenet")
+    if settings is False or settings is None and "battlenet" in config:
+        return [], None
+    settings = settings if isinstance(settings, dict) else {}
+    prefix = os.path.expanduser(str(settings.get("prefix") or BNET_DEFAULT_PREFIX))
+    if not os.path.isfile(os.path.join(prefix, BNET_LAUNCHER)):
+        return [], None
+    codes = {}
+    for path in glob.glob(os.path.join(prefix, "drive_c", "users", "*", "AppData", "Roaming", "Battle.net", "Battle.net.config")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for code, entry in (data.get("Games") or {}).items():
+            if isinstance(entry, dict):
+                codes[code.lower()] = entry
+    program_files = os.path.join(prefix, "drive_c", "Program Files (x86)")
+    games = []
+    for code, entry in codes.items():
+        if code in BNET_NOT_GAMES or code not in BNET_PRODUCTS:
+            continue
+        name, folder, exes, launch_code = BNET_PRODUCTS[code]
+        games.append({
+            "id": f"bnet:{code}",
+            "store": "Battle.net",
+            "name": name,
+            "classes": [exe.lower() for exe in exes],
+            "installed": os.path.isdir(os.path.join(program_files, folder)),
+            "lastPlayedHint": int(entry.get("LastPlayed") or 0),
+            "play": bnet_play_command(prefix, launch_code, settings.get("play")),
+        })
+    return games, prefix
+
+
+def watched_games(config):
+    """Every game Vapour times itself: discovered Battle.net products, then the
+    entries in games.json (which can also override a discovered one by id)."""
+    games, _ = discover_battlenet(config)
+    by_id = {g["id"]: g for g in games}
+    for entry in config.get("games") or []:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        game_id = str(entry["id"])
+        base = by_id.get(game_id) or {"id": game_id, "store": "Other", "name": game_id, "classes": [], "installed": None, "play": None}
+        if entry.get("name"):
+            base["name"] = str(entry["name"])
+        if entry.get("store"):
+            base["store"] = str(entry["store"])
+        if isinstance(entry.get("classes"), list):
+            base["classes"] = [str(c).lower() for c in entry["classes"]]
+        if entry.get("play") is not None:
+            base["play"] = str(entry["play"]) or None
+        if entry.get("installed") is not None:
+            base["installed"] = bool(entry["installed"])
+        if entry.get("hidden"):
+            by_id.pop(game_id, None)
+            continue
+        by_id[game_id] = base
+    return list(by_id.values())
 
 
 # ---------------------------------------------------------------- names
@@ -264,7 +470,7 @@ def fetch_app(appid):
     """Keyless store lookup. Failures are cached for a day so a dead entry is not retried every run."""
     payload = {"name": None, "headerImage": None, "fetchedAt": int(time.time())}
     try:
-        req = urllib.request.Request(STORE_API.format(appid=appid), headers={"User-Agent": "omarchy-steam-plugin"})
+        req = urllib.request.Request(STORE_API.format(appid=appid), headers={"User-Agent": "omarchy-vapour"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             body = json.load(resp)
         entry = body.get(str(appid)) or {}
@@ -290,35 +496,45 @@ def resolve_app(appid, installed_names, allow_network):
     return fetch_app(appid)
 
 
+# ----------------------------------------------------------------- hltb
+
+def hltb_cache_name(game_id):
+    """Game id to a cache file name: "steam:123" -> steam-123.json."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(game_id)) + ".json"
+
+
 def hltb_overrides():
     """Hand-maintained lengths that beat whatever HowLongToBeat says:
-    { "<appid>": { "main": 22.5, "extra": 31, "completionist": 48 } } in hours."""
+    { "steam:1161580": { "main": 22.5, "extra": 31, "completionist": 48 } } in
+    hours. A bare Steam app id ("1161580") still works."""
     try:
         with open(os.path.join(CONFIG_DIR, "hltb-overrides.json"), encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+    if not isinstance(data, dict):
+        return {}
+    return {(f"steam:{k}" if str(k).isdigit() else str(k)): v for k, v in data.items()}
 
 
-def hltb_cached(appid):
+def hltb_cached(game_id):
     try:
-        with open(os.path.join(HLTB_CACHE_DIR, f"{appid}.json"), encoding="utf-8") as f:
+        with open(os.path.join(HLTB_CACHE_DIR, hltb_cache_name(game_id)), encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
 
 
-def hltb_for(appid, overrides, enabled):
+def hltb_for(game_id, overrides, enabled):
     """(hltb block or None, status). Status is one of override, ok, nodata,
     missing, error, pending, off — the panel words each of them."""
-    override = overrides.get(appid)
+    override = overrides.get(game_id)
     if isinstance(override, dict):
         return {**{k: override.get(k) for k in ("main", "extra", "completionist")}, "source": "override"}, "override"
     if not enabled:
         return None, "off"
-    cached = hltb_cached(appid)
+    cached = hltb_cached(game_id)
     if cached is None:
         return None, "pending"
     status = str(cached.get("status") or "error")
@@ -347,6 +563,52 @@ def spawn_hltb():
         print(f"collect: could not start hltb: {exc}", file=sys.stderr)
 
 
+# ------------------------------------------------------------ migration
+
+def migrate_from_steam_dirs():
+    """Vapour used to live under omarchy/steam. Move whatever is still there,
+    one item at a time so a half-moved layout (say, hltb ran first) heals too.
+    HowLongToBeat cache files were named <appid>.json; they become steam-<appid>.json."""
+    moves = [
+        (os.path.join(XDG_STATE, "omarchy", "steam", "playtime.json"), RECORD_PATH),
+        (os.path.join(XDG_STATE, "omarchy", "steam", "snapshots"), SNAPSHOT_DIR),
+        (os.path.join(XDG_CACHE, "omarchy", "steam", "apps"), APPS_CACHE_DIR),
+        (os.path.join(XDG_CACHE, "omarchy", "steam", "hltb"), HLTB_CACHE_DIR),
+        (os.path.join(XDG_CONFIG, "omarchy", "steam", "hltb-overrides.json"), os.path.join(CONFIG_DIR, "hltb-overrides.json")),
+    ]
+    for old, new in moves:
+        if not os.path.exists(old):
+            continue
+        try:
+            if os.path.exists(new):
+                if os.path.isdir(old) and os.path.isdir(new):
+                    for name in os.listdir(old):
+                        if not os.path.exists(os.path.join(new, name)):
+                            shutil.move(os.path.join(old, name), os.path.join(new, name))
+                    os.rmdir(old)
+                else:
+                    os.remove(old)
+            else:
+                os.makedirs(os.path.dirname(new), exist_ok=True)
+                shutil.move(old, new)
+        except OSError as exc:
+            print(f"collect: could not migrate {old}: {exc}", file=sys.stderr)
+    for base in (XDG_STATE, XDG_CACHE, XDG_CONFIG):
+        old_dir = os.path.join(base, "omarchy", "steam")
+        try:
+            if os.path.isdir(old_dir) and not os.listdir(old_dir):
+                os.rmdir(old_dir)
+        except OSError:
+            pass
+    try:
+        for name in os.listdir(HLTB_CACHE_DIR):
+            m = re.match(r"(\d+)\.json$", name)
+            if m and not os.path.exists(os.path.join(HLTB_CACHE_DIR, f"steam-{m.group(1)}.json")):
+                os.replace(os.path.join(HLTB_CACHE_DIR, name), os.path.join(HLTB_CACHE_DIR, f"steam-{m.group(1)}.json"))
+    except OSError:
+        pass
+
+
 # ----------------------------------------------------------------- main
 
 def main():
@@ -358,16 +620,21 @@ def main():
     parser.add_argument("--no-hltb-spawn", action="store_true", help="read cached lengths but start no lookup (used by bin/hltb when it regenerates the record)")
     args = parser.parse_args()
 
+    migrate_from_steam_dirs()
+
     now = today()
+    now_dt = dt.datetime.now().astimezone()
     record = {
-        "schemaVersion": 1,
-        "updatedAt": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "schemaVersion": 2,
+        "updatedAt": now_dt.isoformat(timespec="seconds"),
         "updatedAtMs": int(time.time() * 1000),
         "weekMode": args.week_mode,
         "minMinutes": args.min_minutes,
         "lookupNames": not args.no_names,
         "hltbEnabled": not args.no_hltb,
         "error": "",
+        "stores": [],
+        "watch": [],
         "games": [],
         "days": [],
         "weekMinutes": 0,
@@ -376,67 +643,114 @@ def main():
         "historyDays": 0,
         "fullWeek": False,
     }
-
-    root = steam_root()
-    user = most_recent_user(root) if root else None
-    if not root or not user:
-        record["error"] = "No Steam installation found"
-        write_json_atomic(RECORD_PATH, record)
-        return 0
-
-    try:
-        playtimes = read_playtimes(root, user)
-    except OSError as exc:
-        record["error"] = f"Could not read Steam playtime: {exc}"
-        write_json_atomic(RECORD_PATH, record)
-        return 0
-
-    current = {appid: p["total"] for appid, p in playtimes.items()}
-    write_json_atomic(snapshot_path(now), current)
-    prune_snapshots(now)
-
-    baseline_day, baseline, target = week_baseline(now, args.week_mode)
-    if baseline is not None:
-        record["weekSource"] = "snapshots"
-        record["baselineDate"] = baseline_day.isoformat()
-        record["historyDays"] = (now - baseline_day).days
-        record["fullWeek"] = baseline_day <= target
-    else:
-        record["weekSource"] = "twoWeeks"
-
-    installed = library_manifests(root)
     overrides = hltb_overrides()
     games = []
-    for appid, p in playtimes.items():
+    errors = []
+
+    # ---- Steam: its own counters, week from snapshots
+    steam_days = [{"date": (now - dt.timedelta(days=o)).isoformat(), "minutes": None} for o in range(6, -1, -1)]
+    root = steam_root()
+    user = most_recent_user(root) if root else None
+    playtimes = None
+    if root and user:
+        try:
+            playtimes = read_playtimes(root, user)
+        except OSError as exc:
+            errors.append(f"Could not read Steam playtime: {exc}")
+    else:
+        errors.append("No Steam installation found")
+
+    if playtimes is not None:
+        current = {appid: p["total"] for appid, p in playtimes.items()}
+        write_json_atomic(snapshot_path(now), current)
+        prune_snapshots(now)
+
+        baseline_day, baseline, target = week_baseline(now, args.week_mode)
         if baseline is not None:
-            week = max(0, p["total"] - baseline.get(appid, 0))
-            if p["twoWeeks"]:
-                week = min(week, p["twoWeeks"])
+            record["weekSource"] = "snapshots"
+            record["baselineDate"] = baseline_day.isoformat()
+            record["historyDays"] = (now - baseline_day).days
+            record["fullWeek"] = baseline_day <= target
         else:
-            week = p["twoWeeks"]
+            record["weekSource"] = "twoWeeks"
+
+        installed = library_manifests(root)
+        for appid, p in playtimes.items():
+            if baseline is not None:
+                week = max(0, p["total"] - baseline.get(appid, 0))
+                if p["twoWeeks"]:
+                    week = min(week, p["twoWeeks"])
+            else:
+                week = p["twoWeeks"]
+            if week < args.min_minutes:
+                continue
+            app = resolve_app(appid, installed, not args.no_names)
+            if not app.get("name"):
+                continue  # non-Steam shortcuts and delisted apps have nothing to show
+            game_id = f"steam:{appid}"
+            hltb, hltb_status = hltb_for(game_id, overrides, not args.no_hltb)
+            games.append({
+                "id": game_id,
+                "store": "Steam",
+                "appId": int(appid),
+                "name": app["name"],
+                "headerImage": app.get("headerImage"),
+                "weekMinutes": week,
+                "twoWeekMinutes": p["twoWeeks"],
+                "totalMinutes": p["total"],
+                "lastPlayed": p["lastPlayed"],
+                "installed": appid in installed,
+                "play": uwsm(["steam", f"steam://rungameid/{int(appid)}"]),
+                "hltb": hltb,
+                "hltbStatus": hltb_status,
+            })
+        steam_days = steam_day_series(now, current)
+
+    # ---- Everything else: timed by Main.qml, figures from the ledger
+    config = load_games_config()
+    watched = watched_games(config)
+    record["watch"] = [{"id": g["id"], "classes": g["classes"]} for g in watched if g["classes"]]
+    spans_by_id = load_sessions()
+    week_lo, week_hi = week_window(now_dt, args.week_mode)
+    for game in watched:
+        spans = spans_by_id.get(game["id"], [])
+        total = overlap_minutes(spans, 0, week_hi)
+        week = overlap_minutes(spans, week_lo, week_hi)
         if week < args.min_minutes:
             continue
-        app = resolve_app(appid, installed, not args.no_names)
-        if not app.get("name"):
-            continue  # non-Steam shortcuts and delisted apps have nothing to show
-        hltb, hltb_status = hltb_for(appid, overrides, not args.no_hltb)
+        last_played = int(max((end for _, end in spans), default=0)) or int(game.get("lastPlayedHint") or 0)
+        hltb, hltb_status = hltb_for(game["id"], overrides, not args.no_hltb)
         games.append({
-            "appId": int(appid),
-            "name": app["name"],
-            "headerImage": app.get("headerImage"),
+            "id": game["id"],
+            "store": game["store"],
+            "appId": 0,
+            "name": game["name"],
+            "headerImage": None,
             "weekMinutes": week,
-            "twoWeekMinutes": p["twoWeeks"],
-            "totalMinutes": p["total"],
-            "lastPlayed": p["lastPlayed"],
-            "installed": appid in installed,
+            "twoWeekMinutes": overlap_minutes(spans, week_hi - 14 * 86400, week_hi),
+            "totalMinutes": total,
+            "lastPlayed": last_played,
+            "installed": game.get("installed"),
+            "play": game.get("play"),
             "hltb": hltb,
             "hltbStatus": hltb_status,
         })
+    tracked_ids = {g["id"] for g in watched}
 
     games.sort(key=lambda g: (-g["weekMinutes"], -g["lastPlayed"]))
     record["games"] = games
+    stores = []
+    for g in games:
+        if g["store"] not in stores:
+            stores.append(g["store"])
+    record["stores"] = stores
     record["weekMinutes"] = sum(g["weekMinutes"] for g in games)
-    record["days"] = day_series(now, current)
+    record["days"] = merge_day_series(steam_days, sessions_day_series(now, {k: v for k, v in spans_by_id.items() if k in tracked_ids}))
+    if record["weekSource"] == "none" and any(g["store"] != "Steam" for g in games):
+        record["weekSource"] = "sessions"
+    # Steam missing is only an error when there is nothing else to show.
+    if errors and not games and not watched:
+        record["error"] = errors[0]
     write_json_atomic(RECORD_PATH, record)
     if not args.no_hltb and not args.no_hltb_spawn and any(g["hltbStatus"] != "override" for g in games):
         spawn_hltb()
