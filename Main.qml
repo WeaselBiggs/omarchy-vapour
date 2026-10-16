@@ -31,7 +31,10 @@ Item {
   readonly property var games: record && Array.isArray(record.games) ? record.games : []
   readonly property var days: record && Array.isArray(record.days) ? record.days : []
   readonly property var stores: record && Array.isArray(record.stores) ? record.stores : []
-  // Games the collector wants timed: [{ id, classes: ["diablo iv.exe", ...] }].
+  // Games the collector wants timed: [{ id, classes: [...], titles: [...] }].
+  // A class match is enough on its own unless the entry lists titles, in which
+  // case the title must start with one of them: umu gives the Battle.net
+  // client and every game it launches the same steam_app_battlenet class.
   readonly property var watch: record && Array.isArray(record.watch) ? record.watch : []
   readonly property int weekMinutes: record ? numberValue(record.weekMinutes) : 0
   readonly property string weekSource: record ? String(record.weekSource || "none") : "none"
@@ -148,13 +151,24 @@ Item {
   property var runningWatched: []
   property bool sessionsSynced: false
 
-  function watchedIdFor(windowClass) {
+  function titleMatches(title, titles) {
+    if (titles.length === 0) return true
+    var text = String(title || "").toLowerCase().trim()
+    for (var i = 0; i < titles.length; i++) {
+      var wanted = String(titles[i]).toLowerCase().trim()
+      if (wanted !== "" && text.indexOf(wanted) === 0) return true
+    }
+    return false
+  }
+
+  function watchedIdFor(windowClass, title) {
     var cls = String(windowClass || "").toLowerCase()
     if (cls === "") return ""
     for (var i = 0; i < watch.length; i++) {
       var classes = watch[i] && Array.isArray(watch[i].classes) ? watch[i].classes : []
+      var titles = watch[i] && Array.isArray(watch[i].titles) ? watch[i].titles : []
       for (var j = 0; j < classes.length; j++)
-        if (String(classes[j]).toLowerCase() === cls) return String(watch[i].id)
+        if (String(classes[j]).toLowerCase() === cls && titleMatches(title, titles)) return String(watch[i].id)
     }
     return ""
   }
@@ -167,7 +181,7 @@ Item {
       for (var i = 0; i < values.length; i++) {
         var cls = String(values[i].appId || "")
         var match = cls.match(/^steam_app_(\d+)$/)
-        var id = match ? "steam:" + match[1] : watchedIdFor(cls)
+        var id = match ? "steam:" + match[1] : watchedIdFor(cls, values[i].title)
         if (id === "" || ids.indexOf(id) >= 0) continue
         ids.push(id)
         if (!match) watched.push(id)

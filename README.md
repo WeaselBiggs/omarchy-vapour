@@ -92,10 +92,13 @@ are dropped. Week, day, two-week and total figures for these games come
 straight from the ledger — no snapshot baseline needed — and the day chart adds
 them to Steam's.
 
-Wine windows carry the executable's name as their class, so Diablo IV is
-`diablo iv.exe` and the client itself is `battle.net.exe`. Matching is
-case-insensitive. If a game does not register, `hyprctl clients` shows its
-class; add it in `games.json` (below).
+Plain Wine windows carry the executable's name as their class (`diablo
+iv.exe`). Under umu-run every window in the prefix, client and games alike, is
+tagged `steam_app_<GAMEID minus umu->` instead — `steam_app_battlenet` for the
+Omarchy install — so a game there is told apart by its title, which is
+expected to start with the product's name. Matching is case-insensitive. If a
+game does not register, `hyprctl clients` shows its class and title; add them
+in `games.json` (below).
 
 **Battle.net discovery.** The collector reads `Battle.net.config` out of the
 prefix (`~/Games/battlenet` by default, where `omarchy-install-gaming-battlenet`
@@ -138,10 +141,12 @@ without being redefined:
 | Key | Meaning |
 |---|---|
 | `battlenet.prefix` | Where the client lives; `"battlenet": false` turns discovery off |
+| `battlenet.gameId` | The `GAMEID` the client is launched with (`umu-battlenet`), which sets the shared window class |
 | `battlenet.play` | Launch template for every Blizzard title: `{prefix}`, `{launcher}` (already shell-quoted) and `{code}` are filled in |
 | `games[].id` | Any string; `bnet:<code>` overrides a discovered product |
 | `games[].name`, `store` | What the row and the rundown say |
 | `games[].classes` | Window classes that mean the game is up (case-insensitive) |
+| `games[].titles` | When set, the title must also start with one of these; how games sharing a class are told apart |
 | `games[].play` | Shell line for the Play button; omit it and the row has none |
 | `games[].installed` | Shown in the rundown when `false` |
 | `games[].hidden` | Drop the game from the panel |

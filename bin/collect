@@ -67,9 +67,15 @@ STORE_API = "https://store.steampowered.com/api/appdetails?appids={appid}&filter
 BNET_DEFAULT_PREFIX = os.path.join(HOME, "Games", "battlenet")
 BNET_LAUNCHER = "drive_c/Program Files (x86)/Battle.net/Battle.net Launcher.exe"
 
+# umu-run tags every Wine window in the prefix with steam_app_<GAMEID minus the
+# umu- prefix>, client and games alike, so a game is told apart by its title.
+BNET_DEFAULT_GAMEID = "umu-battlenet"
+
 # Battle.net product code (as it appears in Battle.net.config) -> display name,
 # install folder under Program Files (x86), the executables whose window means
-# the game is up, and the code `Battle.net Launcher.exe --exec="launch X"` takes.
+# the game is up (seen as the class under plain Wine), and the code
+# `Battle.net Launcher.exe --exec="launch X"` takes. The window title is
+# expected to start with the display name; games.json can say otherwise.
 BNET_PRODUCTS = {
     "fenris": ("Diablo IV", "Diablo IV", ["Diablo IV.exe"], "Fen"),
     "osi": ("Diablo II: Resurrected", "Diablo II Resurrected", ["D2R.exe"], "OSI"),
@@ -412,6 +418,8 @@ def discover_battlenet(config):
             if isinstance(entry, dict):
                 codes[code.lower()] = entry
     program_files = os.path.join(prefix, "drive_c", "Program Files (x86)")
+    game_id = str(settings.get("gameId") or BNET_DEFAULT_GAMEID)
+    umu_class = "steam_app_" + re.sub(r"^umu-", "", game_id).lower()
     games = []
     for code, entry in codes.items():
         if code in BNET_NOT_GAMES or code not in BNET_PRODUCTS:
@@ -421,7 +429,8 @@ def discover_battlenet(config):
             "id": f"bnet:{code}",
             "store": "Battle.net",
             "name": name,
-            "classes": [exe.lower() for exe in exes],
+            "classes": [exe.lower() for exe in exes] + [umu_class],
+            "titles": [name],
             "installed": os.path.isdir(os.path.join(program_files, folder)),
             "lastPlayedHint": int(entry.get("LastPlayed") or 0),
             "play": bnet_play_command(prefix, launch_code, settings.get("play")),
@@ -438,13 +447,15 @@ def watched_games(config):
         if not isinstance(entry, dict) or not entry.get("id"):
             continue
         game_id = str(entry["id"])
-        base = by_id.get(game_id) or {"id": game_id, "store": "Other", "name": game_id, "classes": [], "installed": None, "play": None}
+        base = by_id.get(game_id) or {"id": game_id, "store": "Other", "name": game_id, "classes": [], "titles": [], "installed": None, "play": None}
         if entry.get("name"):
             base["name"] = str(entry["name"])
         if entry.get("store"):
             base["store"] = str(entry["store"])
         if isinstance(entry.get("classes"), list):
             base["classes"] = [str(c).lower() for c in entry["classes"]]
+        if isinstance(entry.get("titles"), list):
+            base["titles"] = [str(t) for t in entry["titles"]]
         if entry.get("play") is not None:
             base["play"] = str(entry["play"]) or None
         if entry.get("installed") is not None:
@@ -709,7 +720,7 @@ def main():
     # ---- Everything else: timed by Main.qml, figures from the ledger
     config = load_games_config()
     watched = watched_games(config)
-    record["watch"] = [{"id": g["id"], "classes": g["classes"]} for g in watched if g["classes"]]
+    record["watch"] = [{"id": g["id"], "classes": g["classes"], "titles": g.get("titles") or []} for g in watched if g["classes"]]
     spans_by_id = load_sessions()
     week_lo, week_hi = week_window(now_dt, args.week_mode)
     for game in watched:
